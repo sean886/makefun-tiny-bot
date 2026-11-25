@@ -1,7 +1,7 @@
 import { runBars } from './vendor/makefun-bars.ts';
 
-const FAST = 5;
-const SLOW = 20;
+const FAST = 8;
+const SLOW = 21;
 const STOP_LOSS_BPS = 1500n;
 const TAKE_PROFIT_BPS = 5000n;
 const BPS = 10_000n;
@@ -9,6 +9,7 @@ const closes = new Map<string, number[]>();
 const emaFast = new Map<string, number>();
 const emaSlow = new Map<string, number>();
 const previousSpread = new Map<string, number>();
+const slowHistory = new Map<string, number[]>();
 
 await runBars({
   onBatch(state, batch) {
@@ -25,6 +26,10 @@ await runBars({
       signals.push({ symbol, crossUp: oldSpread !== undefined && oldSpread <= 0 && spread > 0, crossDown: oldSpread !== undefined && oldSpread >= 0 && spread < 0 });
       emaFast.set(symbol, nextFast);
       emaSlow.set(symbol, nextSlow);
+      const slowValues = slowHistory.get(symbol) ?? [];
+      slowValues.push(nextSlow);
+      if (slowValues.length > 4) slowValues.shift();
+      slowHistory.set(symbol, slowValues);
       previousSpread.set(symbol, spread);
       const history = closes.get(symbol) ?? [];
       history.push(price);
@@ -37,7 +42,7 @@ await runBars({
     const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
     const openSymbols = new Set(state.positions.keys());
     let slots = Math.max(0, state.hello.caps.max_open_positions - openSymbols.size);
-    const eligible = signals.filter((s) => s.crossUp && !openSymbols.has(s.symbol) && (closes.get(s.symbol)?.length ?? 0) >= SLOW);
+    const eligible = signals.filter((s) => s.crossUp && (slowHistory.get(s.symbol)?.length ?? 0) >= 4 && slowHistory.get(s.symbol)![3] > slowHistory.get(s.symbol)![0] && !openSymbols.has(s.symbol) && (closes.get(s.symbol)?.length ?? 0) >= SLOW);
     const divisor = BigInt(Math.max(1, eligible.length));
     for (const signal of signals) {
       const held = state.positions.get(signal.symbol);
@@ -47,18 +52,18 @@ await runBars({
         const loss = mark * BPS <= held.cost * (BPS - STOP_LOSS_BPS);
         const gain = mark * BPS >= held.cost * (BPS + TAKE_PROFIT_BPS);
         if (signal.crossDown || loss || gain) {
-          orders.push({ side: 'sell', symbol: signal.symbol, qty: held.qty, max_slippage_bps: 10_000 });
+          orders.push({ side: 'sell', symbol: signal.symbol, qty: held.qty, max_slippage_bps: 100 });
         }
       }
     }
     for (const signal of signals) {
-      if (!signal.crossUp || openSymbols.has(signal.symbol) || slots <= 0 || orders.length >= state.hello.caps.max_orders_per_bar) continue;
+      if (!signal.crossUp || (slowHistory.get(signal.symbol)?.length ?? 0) < 4 || slowHistory.get(signal.symbol)![3] <= slowHistory.get(signal.symbol)![0] || openSymbols.has(signal.symbol) || slots <= 0 || orders.length >= state.hello.caps.max_orders_per_bar) continue;
       if ((closes.get(signal.symbol)?.length ?? 0) < SLOW) continue;
       const weightRoom = state.weightRoom(signal.symbol);
       const cashShare = state.cash / divisor;
       const amount = [weightRoom, cashShare].reduce((a, b) => a < b ? a : b);
       if (amount < minNotional) continue;
-      orders.push({ side: 'buy', symbol: signal.symbol, notional_quote_units: amount, max_slippage_bps: 10_000 });
+      orders.push({ side: 'buy', symbol: signal.symbol, notional_quote_units: amount, max_slippage_bps: 100 });
       slots--;
     }
     return orders;
